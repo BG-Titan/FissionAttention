@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fissionattn"
+version = "0.1.0"
+description = "FISSION_ATTN: CUDA-core absorbed-MLA decode backend for vLLM (sm_61+/Pascal)"
+readme = "README.md"
+requires-python = ">=3.10"
+# No hard torch dependency: inside vLLM the framework provides it, and the
+# CPU test suite is numpy-only by design.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["numpy", "pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+fissionattn = "fissionattn.plugin:register"
+
+[tool.setuptools]
+packages = ["fissionattn"]
+
+[tool.setuptools.package-data]
+fissionattn = ["*.so", "*.pyi"]

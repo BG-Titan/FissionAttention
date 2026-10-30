@@ -1,0 +1,93 @@
+Metadata-Version: 2.4
+Name: fissionattn
+Version: 0.1.0
+Summary: FISSION_ATTN: CUDA-core absorbed-MLA decode backend for vLLM (sm_61+/Pascal)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: numpy; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
+
+# fissionattn — `FISSION_ATTN`：CUDA-core 上的 MLA 吸收式解码后端
+
+后端名：`FISSION_ATTN`（解码 + MLA prefill 同名）
+入口：`fissionattn.plugin:register`（`vllm.general_plugins`；另有 `load()` 别名）
+内核：`csrc/mla.cu`，extern-C `fissionattn_abi()==1` / `fissionattn_has_gpu()` /
+`fissionattn_decode(...)`（返回 `cudaError_t`，参数错误为 `-10xx`）
+
+## 做什么
+
+给**没有 tensor-core 注意力库**的 GPU（Pascal sm_61：无 bf16、无 flash-attn 构建）
+提供一个能跑、可验证的 MLA 后端：
+
+- **解码**：本包 CUDA 内核，一个 warp 负责一个 `(query 行, query 头)`，
+  在线 softmax + D 分块点积，**不用共享内存、不用 tensor core**。
+- **prefill**：`prefill_backend.py`/`prefill_forward.py`/`prefill.py` 的
+  torch 分块实现（按 request 循环、按 chunk 控显存），插进 vLLM 的
+  `MLAPrefillBackend` 槽位。不是性能实现，只是让混合步能跑通。
+
+内核 ABI 与形状契约、以及"上线前必须用真实 MLA checkpoint 验证的清单"写在
+[`docs/mla-design.md`](../docs/mla-design.md)（含实测吞吐与寄存器占用）。
+
+## 数据契约（摘要）
+
+- 解码 `q`：`[rows, num_q_heads, kv_lora_rank + qk_rope_head_dim]`（例 512+64=576）
+- paged cache：`[num_blocks, 1, page, 576]`（vLLM `MLAAttentionSpec` 布局，
+  单个 latent 物理头，rope 分量并排存尾部；`[blocks, page, D]` 也接受）
+- `out`：`[rows, num_q_heads, out_dim]`，`out_dim ≤ D`（吸收式只要 latent 前缀）；
+  `out_dim=0` 表示只出 LSE
+- 上限：`D ≤ 768`（`FMLA_MAX_D`）、`out_dim ≤ 512`（`FMLA_MAX_OV`），
+  dtype 支持 fp16/bf16（`dtype_code 0/1`），索引 int32/int64
+
+非 MLA 模型无需额外拒绝：`FissionAttentionBackend` 继承 `MLACommonBackend`
+（`is_mla()==True`），vLLM 自己的 `validate_configuration` 就会拒绝错配。
+
+## 构建
+
+```bash
+cd fissionattn
+PATH=/usr/local/cuda/bin:$PATH \
+FISSION_ATTN_CUDA_ARCHS=6.1 \
+/home/amd/dsh-work/.venv312/bin/python setup.py build_py --build-lib .buildlib
+# 产物：fissionattn/_mla<EXT_SUFFIX>（纯 nvcc -shared，extern-C；无 torch 头）
+```
+
+`ops.py` 用 **ctypes** 打开 `_mla*.so`（包目录或 `FISSION_ATTN_SO` 指定路径），
+符号缺失/ABI 不符 → 自动退回 `ref.py` 的 torch 参考实现（慢但保证可导入、
+可测）；`FISSION_ATTN_REQUIRE_NATIVE=1` 把该回退变成报错。
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `FISSION_ATTN_SKIP_BUILD=1` | 跳过 nvcc，只装 Python |
+| `FISSION_ATTN_CUDA_ARCHS` | gencode 列表，默认 `6.1;7.5;8.0;8.6;8.9;9.0` |
+| `FISSION_ATTN_NVCC` / `FISSION_ATTN_CCBIN` | 指定 nvcc / 宿主 g++（默认找 `g++-13`） |
+| `FISSION_ATTN_SO` | 直接指定 `.so` 路径 |
+| `FISSION_ATTN_REQUIRE_NATIVE=1` | 内核不可用时报错而非退回 torch |
+| `FISSION_ATTN_TORCH_DECODE=1` | 强制走 torch 解码参考（对照调试） |
+| `FISSION_ATTN_AUTO=1` | 仅对 `use_mla` 为真的计划把 `FISSION_ATTN` 插入候选优先级 |
+| `FISSION_ATTN_NO_PREFILL_FALLBACK=1` | 不安装 MLA prefill 兜底后端 |
+| `FISSION_ATTN_PREFILL_CHUNK_KEYS` | prefill 每次处理的 key 数（默认 512，下限 64） |
+| `FISSION_ATTN_LOG` | 日志级别 |
+
+## 启用
+
+```bash
+export VLLM_PLUGINS=fissionattn
+vllm serve <mla-ckpt> --attention-backend FISSION_ATTN
+```
+
+## 测试与完成度
+
+`tests/`（`conftest.py` 负责 CPU/GPU 选择）：
+
+- `test_mla_math_numpy.py`：numpy 双遍实现 vs 朴素注意力公式（纯 CPU）。
+- `test_mla_decode_torch_cpu.py`：`ref.py` torch 解码 vs 朴素实现；分页/掩码边界。
+- `test_mla_decode_torch_gpu.py`：**内核 vs torch 参考**逐元素对齐——
+  fp16/bf16、`page ∈ {1,8,16}`、`out_dim ∈ {576,512,0}`、真实 `D=576` 几何、
+  带 padding 的非连续 cache 视图、int32/int64 索引、非法入参。
+- `test_mla_prefill_torch_cpu.py`：分块 prefill 前向 vs 稠密参考。
+
+已验证：解码数学、内核数值对齐、prefill 数学、引擎侧导入与后端注册。
+**未验证**：真实 MLA checkpoint 上的端到端接线（`q` 拼接来源、fp8 latent cache、
+CUDA graph 捕获、chunked prefill 与 decode 混合步、TP/DCP、精度）。
+逐条清单见 [`docs/mla-design.md`](../docs/mla-design.md) §6。
